@@ -6,7 +6,10 @@ using ArcFace-style embeddings (InsightFace buffalo_l).
 Examples:
   python main.py enroll
   python main.py enroll --name alice
-  python main.py enroll --name alice --auto-pose
+  python main.py enroll --no-auto-pose
+  python main.py enroll --droidcam
+  python main.py enroll --droidcam 192.168.1.42
+  python main.py enroll --camera 0
   python main.py enroll --name bob --video ./clip.mp4
   python main.py recognize --image ./group.jpg
   python main.py recognize --image ./group.jpg --out ./out.jpg --show
@@ -39,8 +42,20 @@ from gallery_store import (
     save_gallery,
 )
 
-# Consecutive frames with good pose + quality before auto-capture (~0.5s at 30 FPS).
-STABLE_FRAMES_AUTO = 15
+# Consecutive good frames before auto-capture. 0 = one good frame only (no multi-frame hold).
+STABLE_FRAMES_AUTO = 0
+
+
+def _auto_pose_stable_needed() -> int:
+    return 1 if STABLE_FRAMES_AUTO <= 0 else STABLE_FRAMES_AUTO
+
+# Looser checks during --auto-pose so brief blur / marginal det scores do not block capture forever.
+AUTO_POSE_QUALITY_KW = dict(
+    det_below=0.40,
+    blur_below=24.0,
+    dark_below=38.0,
+    bright_above=248.0,
+)
 
 # One prompt per capture; extend or reorder as you like.
 DEFAULT_POSE_PROMPTS: List[str] = [
@@ -49,6 +64,7 @@ DEFAULT_POSE_PROMPTS: List[str] = [
     "Turn your face RIGHT (show your left cheek)",
     "Tilt your face UP slightly",
     "Tilt your face DOWN slightly",
+    "Open your mouth wide (say \"ah\") while facing the camera",
 ]
 
 
@@ -94,15 +110,38 @@ def _print_pairwise_cosine_matrix(embeddings: List[np.ndarray]) -> None:
         print(row)
 
 
-def _open_capture(video_path: Optional[str]) -> cv2.VideoCapture:
+def _is_local_video_file(vp: Optional[str]) -> bool:
+    """False for HTTP(S) streams (DroidCam, IP cameras); True for on-disk files."""
+    if not vp:
+        return False
+    s = str(vp).strip()
+    if s.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        return Path(s).expanduser().resolve().is_file()
+    except OSError:
+        return False
+
+
+def _open_capture(video_path: Optional[str], camera_index: int = 0) -> cv2.VideoCapture:
     if video_path:
-        cap = cv2.VideoCapture(video_path)
+        s = str(video_path).strip()
+        if s.lower().startswith(("http://", "https://")):
+            cap = cv2.VideoCapture(s, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(s)
+        else:
+            cap = cv2.VideoCapture(s)
         if not cap.isOpened():
             raise SystemExit(f"Could not open video: {video_path}")
         return cap
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        raise SystemExit("Could not open webcam (device 0). Try --video path/to/file.mp4")
+        raise SystemExit(
+            f"Could not open webcam (camera index {camera_index}). "
+            "Try --camera 1 if the laptop has multiple devices, "
+            "--video path/to/file.mp4, or DroidCam: python main.py enroll --droidcam"
+        )
     return cap
 
 
@@ -112,6 +151,7 @@ def run_enroll(
     prompts: List[str],
     gallery_root: Path,
     auto_pose: bool = False,
+    camera_index: int = 0,
 ) -> None:
     person_id = resolve_person_id(name)
     if not (name or "").strip():
@@ -119,13 +159,15 @@ def run_enroll(
 
     pipeline = FacePipeline()
     gallery = load_gallery(gallery_root)
-    cap = _open_capture(video_path)
+    if video_path is None:
+        print(f"Opening laptop/webcam: camera index {camera_index} (change with --camera N)")
+    cap = _open_capture(video_path, camera_index=camera_index)
     captured: List[np.ndarray] = []
     step = 0
 
-    if auto_pose and video_path:
+    if auto_pose and video_path and _is_local_video_file(video_path):
         print(
-            "Note: --auto-pose is intended for webcam; disabling auto-pose for file video "
+            "Note: --auto-pose is intended for webcam / live streams; disabling auto-pose for file video "
             "(use SPACE to capture each frame)."
         )
         auto_pose = False
@@ -147,9 +189,19 @@ def run_enroll(
 
     print(f"\nEnrolling: {person_id!r}")
     if auto_pose:
+        if STABLE_FRAMES_AUTO <= 0:
+            print(
+                "Auto-pose: captures as soon as pose + quality look good (stability window = 0); "
+                "SPACE always captures manually."
+            )
+        else:
+            print(
+                f"Auto-pose: hold each pose until the HUD stable counter reaches "
+                f"{STABLE_FRAMES_AUTO}; SPACE always captures manually."
+            )
         print(
-            f"Auto-pose: hold each instructed pose ~{STABLE_FRAMES_AUTO} stable frames; "
-            "SPACE still captures manually. Poor light/blur blocks auto until fixed."
+            "Auto uses slightly relaxed brightness/blur/detector checks; orange banner = still try to improve. "
+            "HUD shows yaw/pitch — if auto never fires, match the pose or fix the banner hints."
         )
     else:
         print("Controls: SPACE = capture this pose | Q = abort enrollment")
@@ -188,6 +240,8 @@ def run_enroll(
             cv2.LINE_AA,
         )
 
+    q_kw = AUTO_POSE_QUALITY_KW if auto_pose else {}
+
     try:
         while step < len(prompts):
             ok, frame = cap.read()
@@ -211,11 +265,11 @@ def run_enroll(
 
             if hits:
                 h0 = hits[0]
-                rep = assess_face_quality(frame, h0.bbox, h0.det_score)
+                rep = assess_face_quality(frame, h0.bbox, h0.det_score, **q_kw)
                 quality_msgs = rep.messages
 
                 if auto_pose and mp_pose is not None:
-                    ypr = mp_pose.process_frame(frame)
+                    ypr = mp_pose.process_frame(frame, prefer_xyxy=h0.bbox)
                     if ypr is None:
                         pose_ok = False
                     else:
@@ -225,16 +279,21 @@ def run_enroll(
                     ytxt = fh - 52
                     if ypr is not None:
                         pitch, yaw, roll = ypr
+                        need = _auto_pose_stable_needed()
+                        if STABLE_FRAMES_AUTO <= 0:
+                            stab_hud = "instant"
+                        else:
+                            stab_hud = f"{stable_pose_frames}/{need}"
                         hud = (
                             f"MediaPipe yaw={yaw:+.0f} pitch={pitch:+.0f}  "
                             f"pose={'OK' if pose_ok else 'adjust'}  "
-                            f"stable={stable_pose_frames}/{STABLE_FRAMES_AUTO}"
+                            f"stable={stab_hud}"
                         )
                     else:
-                        hud = "MediaPipe: no head pose — show your face"
+                        hud = "MediaPipe: no head pose — center face / one person"
                     cv2.putText(
                         show,
-                        hud[:85],
+                        hud[:92],
                         (10, ytxt),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.52,
@@ -242,6 +301,30 @@ def run_enroll(
                         2,
                         cv2.LINE_AA,
                     )
+                    if not quality_msgs and not pose_ok and ypr is not None:
+                        pitch, yaw, roll = ypr
+                        cv2.putText(
+                            show,
+                            f"Target (step {step + 1}): yaw in [{gate.yaw_min},{gate.yaw_max}] "
+                            f"pitch in [{gate.pitch_min},{gate.pitch_max}]",
+                            (10, ytxt + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            (200, 200, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                    elif quality_msgs and auto_pose:
+                        cv2.putText(
+                            show,
+                            "Auto blocked: fix quality tips (bottom) OR wait for clearer frame",
+                            (10, ytxt + 22),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45,
+                            (80, 180, 255),
+                            1,
+                            cv2.LINE_AA,
+                        )
 
                 x1, y1, x2, y2 = h0.bbox.astype(int)
                 cv2.rectangle(show, (x1, y1), (x2, y2), (0, 255, 0), 2, cv2.LINE_AA)
@@ -322,7 +405,7 @@ def run_enroll(
             auto_fire = (
                 auto_pose
                 and hits
-                and stable_pose_frames >= STABLE_FRAMES_AUTO
+                and stable_pose_frames >= _auto_pose_stable_needed()
                 and not quality_msgs
                 and pose_ok
             )
@@ -336,7 +419,7 @@ def run_enroll(
                     print(
                         f"  {len(hits)} faces in frame — using largest (closest) face for enrollment."
                     )
-                rep = assess_face_quality(frame, hit.bbox, hit.det_score)
+                rep = assess_face_quality(frame, hit.bbox, hit.det_score, **q_kw)
                 if auto_fire and rep.messages:
                     stable_pose_frames = 0
                     continue
@@ -506,12 +589,30 @@ def main() -> None:
         default=None,
         help="Person id in the gallery (default: random UUID if omitted)",
     )
-    p_en.add_argument("--video", default=None, help="Use video file instead of webcam")
+    p_en.add_argument("--video", default=None, help="Use video file or stream URL instead of webcam")
+    p_en.add_argument(
+        "--camera",
+        type=int,
+        default=0,
+        metavar="N",
+        help="OpenCV camera index for laptop webcam (default 0). Ignored with --video or --droidcam.",
+    )
+    p_en.add_argument(
+        "--droidcam",
+        nargs="?",
+        const="127.0.0.1",
+        default=None,
+        metavar="HOST",
+        help=(
+            "Use DroidCam MJPEG at http://HOST:4747/mjpegfeed (default HOST: 127.0.0.1 for USB; "
+            "use the IP shown in the DroidCam app on Wi‑Fi). Cannot be combined with --video."
+        ),
+    )
     p_en.add_argument("--gallery-dir", type=Path, default=gdir, help="Gallery storage directory")
     p_en.add_argument(
-        "--auto-pose",
+        "--no-auto-pose",
         action="store_true",
-        help="Webcam only: auto-capture each pose when head angle + lighting look good (SPACE still works)",
+        help="Webcam only: do not auto-capture when head pose matches each prompt (use SPACE only)",
     )
 
     p_re = sub.add_parser("recognize", help="Detect faces in an image and match to gallery")
@@ -542,12 +643,23 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.cmd == "enroll":
+        if args.droidcam is not None and args.video is not None:
+            parser.error("Use either --video or --droidcam, not both")
+        enroll_video: Optional[str] = args.video
+        if args.droidcam is not None:
+            enroll_video = f"http://{args.droidcam}:4747/mjpegfeed"
+            print(f"DroidCam stream: {enroll_video}")
+        enroll_auto_pose = (
+            not args.no_auto_pose
+            and (enroll_video is None or not _is_local_video_file(enroll_video))
+        )
         run_enroll(
             args.name,
-            args.video,
+            enroll_video,
             DEFAULT_POSE_PROMPTS,
             args.gallery_dir,
-            auto_pose=args.auto_pose,
+            auto_pose=enroll_auto_pose,
+            camera_index=args.camera,
         )
     elif args.cmd == "recognize":
         run_recognize(

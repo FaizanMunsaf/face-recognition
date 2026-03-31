@@ -9,10 +9,11 @@ from __future__ import annotations
 import math
 import urllib.request
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+import time
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
@@ -47,6 +48,50 @@ _LM_IDS = [
     _LM_MOUTH_LEFT,
     _LM_MOUTH_RIGHT,
 ]
+
+
+def _landmarks_xyxy(lm, w: int, h: int) -> np.ndarray:
+    xs = [p.x * w for p in lm]
+    ys = [p.y * h for p in lm]
+    return np.array([min(xs), min(ys), max(xs), max(ys)], dtype=np.float64)
+
+
+def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+    ax1, ay1, ax2, ay2 = a.astype(float)
+    bx1, by1, bx2, by2 = b.astype(float)
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    aa = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = aa + ba - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def _pick_landmarks_for_bbox(
+    candidates: list, w: int, h: int, prefer_xyxy: np.ndarray
+) -> Optional[list]:
+    """Choose MediaPipe face whose landmark hull best overlaps InsightFace bbox."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    pb = prefer_xyxy.astype(np.float64)
+    best_i, best = 0, -1.0
+    for i, lm in enumerate(candidates):
+        bb = _landmarks_xyxy(lm, w, h)
+        score = _iou_xyxy(pb, bb)
+        if score <= 0:
+            # centroid distance fallback
+            cx, cy = (pb[0] + pb[2]) * 0.5, (pb[1] + pb[3]) * 0.5
+            mx, my = (bb[0] + bb[2]) * 0.5, (bb[1] + bb[3]) * 0.5
+            score = -float((cx - mx) ** 2 + (cy - my) ** 2) * 1e-6
+        if score > best:
+            best, best_i = score, i
+    return candidates[best_i]
 
 
 def default_model_path() -> Path:
@@ -96,15 +141,14 @@ class MediaPipeHeadPose:
         opts = FaceLandmarkerOptions(
             base_options=bo.BaseOptions(model_asset_path=str(mp_path)),
             running_mode=RunningMode.VIDEO,
-            num_faces=1,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            num_faces=5,
+            min_face_detection_confidence=0.4,
+            min_face_presence_confidence=0.4,
+            min_tracking_confidence=0.4,
         )
         self._landmarker = FaceLandmarker.create_from_options(opts)
         self._mp_Image = mp.Image
         self._ImageFormat = mp.ImageFormat
-        self._ts_ms = 0
 
     def close(self) -> None:
         if self._landmarker is not None:
@@ -112,10 +156,15 @@ class MediaPipeHeadPose:
             self._landmarker = None
 
     def process_frame(
-        self, frame_bgr: np.ndarray
+        self,
+        frame_bgr: np.ndarray,
+        prefer_xyxy: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[float, float, float]]:
         """
         Returns (pitch, yaw, roll) in degrees, or None if no face / landmarks.
+
+        When ``prefer_xyxy`` is set (InsightFace xyxy), picks the MediaPipe face that
+        best overlaps that box so pose matches the face we embed.
         """
         if self._landmarker is None:
             return None
@@ -124,11 +173,16 @@ class MediaPipeHeadPose:
         mp_image = self._mp_Image(
             image_format=self._ImageFormat.SRGB, data=rgb
         )
-        self._ts_ms += 33
-        res = self._landmarker.detect_for_video(mp_image, self._ts_ms)
+        ts_ms = int(time.monotonic() * 1000)
+        res = self._landmarker.detect_for_video(mp_image, ts_ms)
         if not res.face_landmarks:
             return None
-        lm = res.face_landmarks[0]
+        faces: List = list(res.face_landmarks)
+        if prefer_xyxy is not None and len(faces) > 0:
+            picked = _pick_landmarks_for_bbox(faces, w, h, prefer_xyxy)
+            lm = picked if picked is not None else faces[0]
+        else:
+            lm = faces[0]
         max_idx = max(_LM_IDS)
         if len(lm) <= max_idx:
             return None

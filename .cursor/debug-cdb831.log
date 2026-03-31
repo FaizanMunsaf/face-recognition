@@ -1,0 +1,5 @@
+{"sessionId": "cdb831", "hypothesisId": "F", "location": "test_eye_mouth_blink.py", "message": "tasks_api_path", "data": {"has_mp_solutions": false}, "timestamp": 1774855666525, "runId": "post-fix"}
+{"sessionId": "cdb831", "hypothesisId": "F", "location": "test_eye_mouth_blink.py", "message": "landmarker_ok", "data": {"model": "/home/faizan/Desktop/take-talker/data/models/face_landmarker.task"}, "timestamp": 1774855666735, "runId": "post-fix"}
+{"sessionId": "cdb831", "hypothesisId": "F", "location": "test_eye_mouth_blink.py", "message": "first_detection", "data": {"n_landmarks": 478, "need_idx": 159}, "timestamp": 1774855670766, "runId": "post-fix"}
+{"sessionId": "cdb831", "hypothesisId": "F", "location": "verify_snippet", "message": "verify_tasks_no_solutions", "data": {"has_solutions": false}, "timestamp": 1774856324313, "runId": "post-fix"}
+{"sessionId": "cdb831", "hypothesisId": "F", "location": "verify_snippet", "message": "verify_face_landmarker_create", "data": {"ok": true, "model": "/home/faizan/Desktop/take-talker/data/models/face_landmarker.task"}, "timestamp": 1774856324462, "runId": "post-fix"}

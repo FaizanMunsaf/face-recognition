@@ -30,13 +30,15 @@ class HeadPoseGate:
 
 
 # Order matches DEFAULT_POSE_PROMPTS in main.py:
-# straight, left, right, up, down
+# straight, left, right, up, down, mouth open (neutral head — yaw/pitch only; open mouth not verified)
+# Bands are intentionally loose: solvePnP + MediaPipe yaw/pitch are approximate.
 POSE_GATES: List[HeadPoseGate] = [
-    HeadPoseGate(yaw_min=-20, yaw_max=20, pitch_min=-22, pitch_max=22),
-    HeadPoseGate(yaw_min=14, yaw_max=72, pitch_min=-35, pitch_max=35),
-    HeadPoseGate(yaw_min=-72, yaw_max=-14, pitch_min=-35, pitch_max=35),
-    HeadPoseGate(yaw_min=-32, yaw_max=32, pitch_min=-65, pitch_max=-6),
-    HeadPoseGate(yaw_min=-32, yaw_max=32, pitch_min=6, pitch_max=65),
+    HeadPoseGate(yaw_min=-32, yaw_max=32, pitch_min=-30, pitch_max=30),
+    HeadPoseGate(yaw_min=8, yaw_max=80, pitch_min=-40, pitch_max=40),
+    HeadPoseGate(yaw_min=-80, yaw_max=-8, pitch_min=-40, pitch_max=40),
+    HeadPoseGate(yaw_min=-40, yaw_max=40, pitch_min=-78, pitch_max=-2),
+    HeadPoseGate(yaw_min=-40, yaw_max=40, pitch_min=2, pitch_max=78),
+    HeadPoseGate(yaw_min=-32, yaw_max=32, pitch_min=-30, pitch_max=30),
 ]
 
 
